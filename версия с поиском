@@ -1,0 +1,995 @@
+# Установка библиотек
+!pip install python-telegram-bot==20.7
+
+# ПОЛНЫЙ КОД БОТА С ПОИСКОМ ТОВАРОВ
+import asyncio
+import logging
+import sqlite3
+import secrets
+import re
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+
+# ========== НАСТРОЙКИ ==========
+TOKEN = "7822369630:AAEMCGXJfqPm3GHrH_ZdLz6H2gk9BV7bVBQ"  # <-- ЗАМЕНИ НА СВОЙ ТОКЕН!
+
+# ========== БАЗА ДАННЫХ ==========
+def init_database():
+    conn = sqlite3.connect('sklad_complete.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS clinics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        code TEXT UNIQUE NOT NULL,
+        admin_chat_id INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS clinic_users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        clinic_id INTEGER,
+        chat_id INTEGER,
+        username TEXT,
+        first_name TEXT,
+        role TEXT DEFAULT 'user',
+        FOREIGN KEY (clinic_id) REFERENCES clinics (id)
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS warehouse (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        clinic_id INTEGER NOT NULL,
+        category TEXT NOT NULL,
+        name TEXT NOT NULL,
+        quantity INTEGER DEFAULT 0,
+        min_quantity INTEGER DEFAULT 1,
+        FOREIGN KEY (clinic_id) REFERENCES clinics (id)
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        clinic_id INTEGER,
+        item_id INTEGER,
+        operation TEXT,
+        quantity INTEGER,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_item_name ON warehouse(name)')
+    
+    conn.commit()
+    conn.close()
+
+init_database()
+print("✅ База данных готова! Индекс поиска создан.")
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+def clean_input(text, max_length=100):
+    if not text:
+        return ""
+    
+    dangerous = [";", "'", "\"", "--", "/*", "*/", "\\", "\x00", "\n", "\r", "\t"]
+    clean_text = text
+    for danger in dangerous:
+        clean_text = clean_text.replace(danger, "")
+    
+    clean_text = re.sub(r'<[^>]+>', '', clean_text)
+    clean_text = re.sub(r'[^\w\s\-.,!?()а-яА-ЯёЁ]', '', clean_text)
+    
+    return clean_text.strip()[:max_length]
+
+def generate_code():
+    return secrets.token_hex(3).upper()
+
+def get_user_clinic(chat_id):
+    conn = sqlite3.connect('sklad_complete.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT c.id, c.name, c.code, cu.role 
+        FROM clinic_users cu
+        JOIN clinics c ON cu.clinic_id = c.id
+        WHERE cu.chat_id = ?
+    ''', (chat_id,))
+    clinic = cursor.fetchone()
+    conn.close()
+    return clinic
+
+def get_clinic_items(clinic_id, category='all'):
+    conn = sqlite3.connect('sklad_complete.db')
+    cursor = conn.cursor()
+    
+    if category == 'all':
+        cursor.execute('''
+            SELECT id, name, quantity, min_quantity, category 
+            FROM warehouse 
+            WHERE clinic_id = ? 
+            ORDER BY category, name
+        ''', (clinic_id,))
+    else:
+        cursor.execute('''
+            SELECT id, name, quantity, min_quantity, category 
+            FROM warehouse 
+            WHERE clinic_id = ? AND category = ?
+            ORDER BY name
+        ''', (clinic_id, category))
+    
+    items = cursor.fetchall()
+    conn.close()
+    return items
+
+def search_items(clinic_id, search_query):
+    """Ищет товары по названию"""
+    conn = sqlite3.connect('sklad_complete.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT id, name, quantity, min_quantity, category 
+        FROM warehouse 
+        WHERE clinic_id = ? AND LOWER(name) LIKE ?
+        ORDER BY 
+            CASE 
+                WHEN LOWER(name) LIKE ? THEN 1
+                WHEN LOWER(name) LIKE ? THEN 2
+                ELSE 3
+            END,
+            name
+        LIMIT 20
+    ''', (clinic_id, 
+          f'%{search_query.lower()}%',
+          f'{search_query.lower()}%',
+          f'% {search_query.lower()}%'
+    ))
+    
+    items = cursor.fetchall()
+    conn.close()
+    return items
+
+def update_item_quantity(item_id, change, operation, clinic_id):
+    conn = sqlite3.connect('sklad_complete.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('UPDATE warehouse SET quantity = quantity + ? WHERE id = ?', (change, item_id))
+    
+    cursor.execute('''
+        INSERT INTO history (clinic_id, item_id, operation, quantity)
+        VALUES (?, ?, ?, ?)
+    ''', (clinic_id, item_id, operation, change))
+    
+    cursor.execute('SELECT name, quantity FROM warehouse WHERE id = ?', (item_id,))
+    result = cursor.fetchone()
+    
+    conn.commit()
+    conn.close()
+    return result
+
+def get_items_to_order(clinic_id):
+    conn = sqlite3.connect('sklad_complete.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT name, quantity, min_quantity 
+        FROM warehouse 
+        WHERE clinic_id = ? AND quantity <= min_quantity
+        ORDER BY quantity ASC
+    ''', (clinic_id,))
+    items = cursor.fetchall()
+    conn.close()
+    return items
+
+def get_clinic_users(clinic_id):
+    conn = sqlite3.connect('sklad_complete.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT first_name, username, role 
+        FROM clinic_users 
+        WHERE clinic_id = ?
+    ''', (clinic_id,))
+    users = cursor.fetchall()
+    conn.close()
+    return users
+
+# ========== КЛАВИАТУРЫ ==========
+def get_main_keyboard(has_clinic=False, is_admin=False):
+    if not has_clinic:
+        return ReplyKeyboardMarkup([
+            ['🏥 Создать клинику'],
+            ['🔑 Ввести код клиники']
+        ], resize_keyboard=True)
+    
+    if is_admin:
+        return ReplyKeyboardMarkup([
+            ['📦 Посмотреть склад', '🔍 Поиск товара'],
+            ['➕ Добавить материал', '➖ Списать'],
+            ['🛒 Что заказать?', '👥 Сотрудники'],
+            ['🔢 Мой код', '🏥 Инфо о клинике'],
+            ['🚪 Выйти']
+        ], resize_keyboard=True)
+    else:
+        return ReplyKeyboardMarkup([
+            ['📦 Наш склад', '🔍 Поиск товара'],
+            ['➖ Списать', '🛒 Что заказать?'],
+            ['🏥 Наша клиника', '🚪 Выйти']
+        ], resize_keyboard=True)
+
+def get_categories_keyboard(clinic_id, action='view'):
+    if action == 'remove':
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🦷 Материалы", callback_data=f'remove_cat_Материалы_{clinic_id}')],
+            [InlineKeyboardButton("🧴 Расходники", callback_data=f'remove_cat_Расходники_{clinic_id}')],
+            [InlineKeyboardButton("🛠️ Инструменты", callback_data=f'remove_cat_Инструменты_{clinic_id}')],
+            [InlineKeyboardButton("📋 Все категории", callback_data=f'remove_cat_all_{clinic_id}')]
+        ])
+    else:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🦷 Материалы", callback_data=f'cat_Материалы_{clinic_id}')],
+            [InlineKeyboardButton("🧴 Расходники", callback_data=f'cat_Расходники_{clinic_id}')],
+            [InlineKeyboardButton("🛠️ Инструменты", callback_data=f'cat_Инструменты_{clinic_id}')],
+            [InlineKeyboardButton("📋 Всё сразу", callback_data=f'cat_all_{clinic_id}')]
+        ])
+
+# ========== КОМАНДЫ ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    clinic = get_user_clinic(chat_id)
+    
+    if clinic:
+        clinic_id, name, code, role = clinic
+        await update.message.reply_text(
+            f"🏥 *{name}*\n"
+            f"Ваша роль: *{role}*\n\n"
+            f"Выберите действие:",
+            reply_markup=get_main_keyboard(True, role == 'admin'),
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text(
+            "📦 *СкладСтом для стоматологий*\n\n"
+            "Система учёта материалов и расходников.\n\n"
+            "Выберите действие:",
+            reply_markup=get_main_keyboard(False, False),
+            parse_mode='Markdown'
+        )
+
+async def leave_clinic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    
+    conn = sqlite3.connect('sklad_complete.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT c.id, c.name, cu.role 
+        FROM clinic_users cu
+        JOIN clinics c ON cu.clinic_id = c.id
+        WHERE cu.chat_id = ?
+    ''', (chat_id,))
+    
+    clinic_info = cursor.fetchone()
+    
+    if not clinic_info:
+        await update.message.reply_text("❌ Вы не состоите ни в одной клинике!")
+        conn.close()
+        return
+    
+    clinic_id, clinic_name, role = clinic_info
+    
+    cursor.execute('DELETE FROM clinic_users WHERE chat_id = ?', (chat_id,))
+    
+    cursor.execute('SELECT COUNT(*) FROM clinic_users WHERE clinic_id = ?', (clinic_id,))
+    remaining_users = cursor.fetchone()[0]
+    
+    if role == 'admin' and remaining_users == 0:
+        cursor.execute('DELETE FROM clinics WHERE id = ?', (clinic_id,))
+        cursor.execute('DELETE FROM warehouse WHERE clinic_id = ?', (clinic_id,))
+        message = f"🗑️ Клиника *{clinic_name}* полностью удалена."
+    else:
+        message = f"👋 Вы вышли из клиники *{clinic_name}*"
+    
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(
+        f"{message}\n\n"
+        f"Теперь можете:\n"
+        f"• Создать новую клинику\n"
+        f"• Присоединиться к другой",
+        parse_mode='Markdown',
+        reply_markup=ReplyKeyboardMarkup([
+            ['🏥 Создать клинику'],
+            ['🔑 Ввести код клиники']
+        ], resize_keyboard=True)
+    )
+
+# ========== ФУНКЦИИ СКЛАДА ==========
+async def show_warehouse(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    clinic = get_user_clinic(chat_id)
+    
+    if not clinic:
+        await update.message.reply_text("❌ Сначала присоединитесь к клинике!")
+        return
+    
+    clinic_id, name, code, role = clinic
+    await update.message.reply_text(
+        f"🏥 *{name}*\n📂 Выберите категорию:",
+        reply_markup=get_categories_keyboard(clinic_id, 'view'),
+        parse_mode='Markdown'
+    )
+
+async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data.split('_')
+    category = data[1]
+    clinic_id = int(data[2])
+    
+    items = get_clinic_items(clinic_id, category)
+    
+    if category == 'all':
+        title = "📦 *ВЕСЬ СКЛАД:*\n\n"
+    else:
+        title = f"📂 *{category.upper()}:*\n\n"
+    
+    if not items:
+        message = title + "Пусто"
+    else:
+        message = title
+        for item in items:
+            item_id, name, quantity, min_qty, item_category = item
+            status = "🟡" if quantity <= min_qty else "🟢"
+            message += f"{status} *{name}*\nОстаток: {quantity} шт. (мин: {min_qty})\n\n"
+    
+    await query.edit_message_text(message, parse_mode='Markdown')
+
+async def remove_item_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    clinic = get_user_clinic(chat_id)
+    
+    if not clinic:
+        await update.message.reply_text("❌ Сначала присоединитесь к клинике!")
+        return
+    
+    clinic_id, name, code, role = clinic
+    await update.message.reply_text(
+        "➖ *Выберите категорию для списания:*",
+        reply_markup=get_categories_keyboard(clinic_id, 'remove'),
+        parse_mode='Markdown'
+    )
+
+async def handle_remove_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data.split('_')
+    category = data[2]
+    clinic_id = int(data[3])
+    
+    items = get_clinic_items(clinic_id, category)
+    
+    if not items:
+        await query.edit_message_text("❌ В этой категории нет товаров!")
+        return
+    
+    keyboard = []
+    for item in items[:15]:
+        item_id, name, quantity, _ = item
+        keyboard.append([InlineKeyboardButton(f"➖ {name} ({quantity} шт.)", callback_data=f'do_remove_{item_id}_{clinic_id}')])
+    
+    await query.edit_message_text(
+        "➖ *Выберите товар для списания:*\n(спишется 1 единица)",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+async def execute_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data.split('_')
+    item_id = int(data[2])
+    clinic_id = int(data[3])
+    
+    result = update_item_quantity(item_id, -1, 'списание', clinic_id)
+    
+    if result:
+        name, new_quantity = result
+        message = f"✅ *Списано!*\n\n*{name}*\nНовый остаток: *{new_quantity} шт.*"
+        
+        conn = sqlite3.connect('sklad_complete.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT min_quantity FROM warehouse WHERE id = ?', (item_id,))
+        min_qty = cursor.fetchone()[0]
+        conn.close()
+        
+        if new_quantity <= min_qty:
+            message += f"\n\n🟡 *Внимание!* Нужно заказать {name}!"
+    
+    await query.edit_message_text(message, parse_mode='Markdown')
+
+async def show_to_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    clinic = get_user_clinic(chat_id)
+    
+    if not clinic:
+        await update.message.reply_text("❌ Сначала присоединитесь к клинике!")
+        return
+    
+    clinic_id, name, code, role = clinic
+    items = get_items_to_order(clinic_id)
+    
+    if not items:
+        message = f"🏥 *{name}*\n✅ Все позиции в норме! Заказывать ничего не нужно."
+    else:
+        message = f"🏥 *{name}*\n🛒 *ПОЗИЦИИ ДЛЯ ЗАКАЗА:*\n\n"
+        for item in items:
+            item_name, quantity, min_qty = item
+            message += f"🟡 *{item_name}*\nОсталось: {quantity} из {min_qty} мин.\n\n"
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def add_item_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    clinic = get_user_clinic(chat_id)
+    
+    if not clinic:
+        await update.message.reply_text("❌ Сначала присоединитесь к клинике!")
+        return
+    
+    clinic_id, name, code, role = clinic
+    
+    if role != 'admin':
+        await update.message.reply_text("⛔ Только администратор может добавлять материалы!")
+        return
+    
+    await update.message.reply_text(
+        "➕ *Добавление нового материала*\n\n"
+        "Введите данные в формате:\n"
+        "`Категория, Название, Количество, Мин.запас`\n\n"
+        "*Пример:*\n"
+        "`Материалы, Бонд, 10, 3`\n\n"
+        "*Категории:* Материалы, Расходники, Инструменты\n\n"
+        "❌ *Отмена:* просто напишите любой текст не в этом формате",
+        parse_mode='Markdown'
+    )
+    context.user_data['adding_item'] = True
+    context.user_data['clinic_id'] = clinic_id
+
+async def show_clinic_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    clinic = get_user_clinic(chat_id)
+    
+    if not clinic:
+        await update.message.reply_text("❌ Сначала присоединитесь к клинике!")
+        return
+    
+    clinic_id, name, code, role = clinic
+    
+    if role != 'admin':
+        await update.message.reply_text("⛔ Только администратор может просматривать сотрудников!")
+        return
+    
+    users = get_clinic_users(clinic_id)
+    
+    message = f"👥 *Сотрудники {name}:*\n\n"
+    
+    for user in users:
+        first_name, username, user_role = user
+        username_display = f"(@{username})" if username else ""
+        message += f"• {first_name} {username_display} - {user_role}\n"
+    
+    message += f"\nВсего: {len(users)} человек\n\n"
+    message += f"🔢 Код клиники: `{code}`"
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def show_clinic_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    clinic = get_user_clinic(chat_id)
+    
+    if not clinic:
+        await update.message.reply_text("❌ Сначала присоединитесь к клинике!")
+        return
+    
+    clinic_id, name, code, role = clinic
+    users = get_clinic_users(clinic_id)
+    
+    conn = sqlite3.connect('sklad_complete.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM warehouse WHERE clinic_id = ?', (clinic_id,))
+    items_count = cursor.fetchone()[0]
+    conn.close()
+    
+    message = (
+        f"🏥 *Информация о клинике:*\n\n"
+        f"• Название: {name}\n"
+        f"• Сотрудников: {len(users)}\n"
+        f"• Материалов: {items_count}\n"
+        f"• Ваша роль: {role}\n"
+    )
+    
+    if role == 'admin':
+        message += f"• Код клиники: `{code}`\n\n"
+        message += "*Как добавить сотрудников:*\n"
+        message += "1. Дайте им код клиники\n"
+        message += "2. Они пишут /start > 'Ввести код клиники'\n"
+        message += "3. Вводят код"
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+# ========== ФУНКЦИИ ПОИСКА ==========
+async def search_items_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    clinic = get_user_clinic(chat_id)
+    
+    if not clinic:
+        await update.message.reply_text("❌ Сначала присоединитесь к клинике!")
+        return
+    
+    clinic_id, name, code, role = clinic
+    
+    await update.message.reply_text(
+        f"🔍 *Поиск товаров*\n\n"
+        f"Введите название товара или часть названия:\n\n"
+        f"*Примеры:*\n"
+        f"• `перчатки` - найдет все перчатки\n"
+        f"• `бонд` - найдет все материалы с 'бонд'\n"
+        f"• `spectra` - найдет Spectra A2\n\n"
+        f"Поиск работает по частичному совпадению.\n"
+        f"❌ *Отмена:* просто напишите что-то другое",
+        parse_mode='Markdown'
+    )
+    
+    context.user_data['searching'] = True
+    context.user_data['clinic_id'] = clinic_id
+
+async def handle_search_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data.split('_')
+    action = data[1]
+    
+    if action == 'item':
+        item_id = int(data[2])
+        clinic_id = int(data[3])
+        
+        conn = sqlite3.connect('sklad_complete.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT name, quantity, min_quantity, category 
+            FROM warehouse 
+            WHERE id = ?
+        ''', (item_id,))
+        
+        item = cursor.fetchone()
+        conn.close()
+        
+        if item:
+            name, quantity, min_qty, category = item
+            status = "🟡 ТРЕБУЕТ ЗАКАЗА" if quantity <= min_qty else "🟢 В НОРМЕ"
+            
+            message = (
+                f"📋 *Информация о товаре:*\n\n"
+                f"*{name}*\n"
+                f"Категория: {category}\n"
+                f"Остаток: {quantity} шт.\n"
+                f"Мин. запас: {min_qty} шт.\n"
+                f"Статус: {status}\n\n"
+                f"Действия с товаром:"
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton("➖ Списать 1 шт.", callback_data=f'remove_from_search_{item_id}_{clinic_id}')],
+                [InlineKeyboardButton("🔍 Искать снова", callback_data=f'new_search_{clinic_id}')],
+                [InlineKeyboardButton("📦 Весь склад", callback_data=f'cat_all_{clinic_id}')]
+            ]
+            
+            await query.edit_message_text(
+                message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+
+async def remove_from_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data.split('_')
+    item_id = int(data[3])
+    clinic_id = int(data[4])
+    
+    result = update_item_quantity(item_id, -1, 'списание через поиск', clinic_id)
+    
+    if result:
+        name, new_quantity = result
+        message = f"✅ *Списано из поиска!*\n\n*{name}*\nНовый остаток: *{new_quantity} шт.*"
+        
+        conn = sqlite3.connect('sklad_complete.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT min_quantity FROM warehouse WHERE id = ?', (item_id,))
+        min_qty = cursor.fetchone()[0]
+        conn.close()
+        
+        if new_quantity <= min_qty:
+            message += f"\n\n🟡 *Внимание!* Нужно заказать {name}!"
+        
+        keyboard = [
+            [InlineKeyboardButton("🔍 Новый поиск", callback_data=f'new_search_{clinic_id}')],
+            [InlineKeyboardButton("📦 Весь склад", callback_data=f'cat_all_{clinic_id}')],
+            [InlineKeyboardButton("🏠 В меню", callback_data=f'back_menu_{clinic_id}')]
+        ]
+        
+        await query.edit_message_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+# ========== ТЕКСТОВЫЕ ОБРАБОТЧИКИ ==========
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    chat_id = update.effective_chat.id
+    
+    if context.user_data.get('searching'):
+        search_query = clean_input(text.strip())
+        
+        if len(search_query) < 2:
+            await update.message.reply_text("❌ Введите хотя бы 2 символа для поиска!")
+            return
+        
+        clinic_id = context.user_data['clinic_id']
+        
+        found_items = search_items(clinic_id, search_query)
+        
+        if not found_items:
+            message = (
+                f"🔍 *По запросу '{search_query}' ничего не найдено*\n\n"
+                f"*Советы:*\n"
+                f"• Проверьте опечатки\n"
+                f"• Используйте более короткий запрос\n"
+                f"• Попробуйте часть слова: 'перч' вместо 'перчатки'\n\n"
+                f"Хотите попробовать снова?"
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton("🔍 Новый поиск", callback_data=f'new_search_{clinic_id}')],
+                [InlineKeyboardButton("📦 Весь склад", callback_data=f'cat_all_{clinic_id}')],
+                [InlineKeyboardButton("🏠 В меню", callback_data=f'back_menu_{clinic_id}')]
+            ]
+            
+            await update.message.reply_text(
+                message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+        else:
+            items_count = len(found_items)
+            message = f"🔍 *Найдено {items_count} товаров по запросу '{search_query}':*\n\n"
+            
+            keyboard = []
+            for item in found_items[:15]:
+                item_id, name, quantity, min_qty, category = item
+                
+                status = "🟡" if quantity <= min_qty else "🟢"
+                message += f"{status} *{name}* ({category})\n"
+                message += f"Остаток: {quantity} шт.\n\n"
+                
+                short_name = name[:25] + "..." if len(name) > 25 else name
+                button_text = f"{status} {short_name} ({quantity} шт.)"
+                keyboard.append([InlineKeyboardButton(button_text, callback_data=f'search_item_{item_id}_{clinic_id}')])
+            
+            if items_count > 15:
+                message += f"\n... и ещё {items_count - 15} товаров"
+            
+            keyboard.append([InlineKeyboardButton("🔍 Новый поиск", callback_data=f'new_search_{clinic_id}')])
+            keyboard.append([InlineKeyboardButton("📦 Весь склад", callback_data=f'cat_all_{clinic_id}')])
+            
+            await update.message.reply_text(
+                message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+        
+        context.user_data['searching'] = False
+        return
+    
+    if context.user_data.get('adding_item'):
+        try:
+            parts = [p.strip() for p in text.split(',')]
+            if len(parts) != 4:
+                raise ValueError
+            
+            category = clean_input(parts[0])
+            name = clean_input(parts[1])
+            quantity_str = parts[2].strip()
+            min_qty_str = parts[3].strip()
+            
+            category = category.capitalize()
+            if category not in ['Материалы', 'Расходники', 'Инструменты']:
+                await update.message.reply_text("❌ Категория должна быть: Материалы, Расходники или Инструменты")
+                return
+            
+            try:
+                quantity = int(quantity_str)
+                min_quantity = int(min_qty_str)
+                
+                if quantity < 0 or min_quantity < 0:
+                    await update.message.reply_text("❌ Количество не может быть отрицательным!")
+                    return
+                
+                if quantity > 10000 or min_quantity > 1000:
+                    await update.message.reply_text("❌ Слишком большое количество! Макс: 10,000")
+                    return
+                    
+            except ValueError:
+                await update.message.reply_text("❌ Введите числа для количества и мин.запаса!")
+                return
+            
+            clinic_id = context.user_data['clinic_id']
+            
+            conn = sqlite3.connect('sklad_complete.db')
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO warehouse (clinic_id, category, name, quantity, min_quantity)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (clinic_id, category, name, quantity, min_quantity))
+            conn.commit()
+            conn.close()
+            
+            await update.message.reply_text(
+                f"✅ *Добавлено!*\n\n"
+                f"*{name}*\n"
+                f"Категория: {category}\n"
+                f"Количество: {quantity} шт.\n"
+                f"Мин.запас: {min_quantity} шт.",
+                parse_mode='Markdown'
+            )
+            
+        except ValueError:
+            await update.message.reply_text(
+                "❌ *Неверный формат!*\n\n"
+                "Используйте: `Категория, Название, Количество, Мин.запас`\n\n"
+                "*Пример:*\n`Материалы, Бонд, 10, 3`\n\n"
+                "Или просто напишите что-то еще для отмены",
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+        
+        context.user_data['adding_item'] = False
+        return
+    
+    clinic = get_user_clinic(chat_id)
+    has_clinic = bool(clinic)
+    is_admin = clinic[3] == 'admin' if clinic else False
+    
+    if text == '🏥 Создать клинику':
+        if has_clinic:
+            await update.message.reply_text("⚠️ Вы уже в клинике! Напишите /leave чтобы выйти.")
+            return
+        
+        await update.message.reply_text(
+            "🏥 *Создание новой клиники*\n\n"
+            "Введите название вашей стоматологии:\n\n"
+            "Пример: *Стоматология 'Улыбка'*\n\n"
+            "❌ *Отмена:* напишите /start",
+            parse_mode='Markdown'
+        )
+        context.user_data['creating_clinic'] = True
+    
+    elif text == '🔑 Ввести код клиники':
+        if has_clinic:
+            await update.message.reply_text("⚠️ Вы уже в клинике! Напишите /leave чтобы выйти.")
+            return
+        
+        await update.message.reply_text(
+            "🔑 *Присоединение к клинике*\n\n"
+            "Введите код клиники (6 символов):\n\n"
+            "Пример: `A1B2C3`\n\n"
+            "Код вам должен дать администратор клиники.\n\n"
+            "❌ *Отмена:* напишите /start",
+            parse_mode='Markdown'
+        )
+        context.user_data['joining_clinic'] = True
+    
+    elif text in ['📦 Посмотреть склад', '📦 Наш склад']:
+        await show_warehouse(update, context)
+    
+    elif text == '🔍 Поиск товара':
+        await search_items_start(update, context)
+    
+    elif text == '➖ Списать':
+        await remove_item_start(update, context)
+    
+    elif text == '🛒 Что заказать?':
+        await show_to_order(update, context)
+    
+    elif text == '➕ Добавить материал':
+        await add_item_start(update, context)
+    
+    elif text == '👥 Сотрудники':
+        await show_clinic_users(update, context)
+    
+    elif text == '🔢 Мой код':
+        if clinic and clinic[3] == 'admin':
+            clinic_id, name, code, role = clinic
+            await update.message.reply_text(
+                f"🏥 *{name}*\n"
+                f"🔢 *Код клиники: {code}*\n\n"
+                f"Дайте этот код сотрудникам для присоединения.",
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text("⛔ Только администратор видит код!")
+    
+    elif text in ['🏥 Инфо о клинике', '🏥 Наша клиника']:
+        await show_clinic_info(update, context)
+    
+    elif text == '🚪 Выйти':
+        await leave_clinic(update, context)
+    
+    elif context.user_data.get('creating_clinic'):
+        clinic_name = clean_input(text.strip())
+        if len(clinic_name) < 2:
+            await update.message.reply_text("❌ Слишком короткое название!")
+            return
+        
+        chat_id = update.effective_chat.id
+        user = update.effective_user
+        
+        conn = sqlite3.connect('sklad_complete.db')
+        cursor = conn.cursor()
+        
+        code = generate_code()
+        
+        cursor.execute('''
+            INSERT INTO clinics (name, code, admin_chat_id)
+            VALUES (?, ?, ?)
+        ''', (clinic_name, code, chat_id))
+        
+        clinic_id = cursor.lastrowid
+        
+        cursor.execute('''
+            INSERT INTO clinic_users (clinic_id, chat_id, username, first_name, role)
+            VALUES (?, ?, ?, ?, 'admin')
+        ''', (clinic_id, chat_id, user.username, user.first_name))
+        
+        test_items = [
+            (clinic_id, 'Материалы', 'Пломбировочный материал Spectra A2', 4, 2),
+            (clinic_id, 'Материалы', 'Ортофосфорная кислота', 1, 3),
+            (clinic_id, 'Расходники', 'Перчатки M', 100, 50),
+            (clinic_id, 'Расходники', 'Маски 3-слойные', 50, 20),
+            (clinic_id, 'Инструменты', 'Наконечники для турбины', 5, 2)
+        ]
+        cursor.executemany("INSERT INTO warehouse (clinic_id, category, name, quantity, min_quantity) VALUES (?, ?, ?, ?, ?)", test_items)
+        
+        conn.commit()
+        conn.close()
+        await update.message.reply_text(
+            f"✅ *Клиника создана!*\n\n"
+            f"🏥 Название: {clinic_name}\n"
+            f"🔢 *КОД КЛИНИКИ: {code}*\n\n"
+            f"⚠️ *СОХРАНИТЕ ЭТОТ КОД!*\n\n"
+            f"Раздайте этот код сотрудникам:\n"
+            f"1. Они пишут боту /start\n"
+            f"2. Выбирают 'Ввести код клиники'\n"
+            f"3. Вводят код: {code}\n\n"
+            f"Теперь вы администратор клиники.",
+            reply_markup=get_main_keyboard(True, True),
+            parse_mode='Markdown'
+        )
+        
+        context.user_data['creating_clinic'] = False
+    
+    elif context.user_data.get('joining_clinic'):
+        # Присоединение к клинике
+        code = clean_input(text.strip().upper(), max_length=6)
+        chat_id = update.effective_chat.id
+        user = update.effective_user
+        
+        conn = sqlite3.connect('sklad_complete.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT id, name FROM clinics WHERE code = ?', (code,))
+        clinic = cursor.fetchone()
+        
+        if clinic:
+            clinic_id, clinic_name = clinic
+            
+            cursor.execute('SELECT * FROM clinic_users WHERE clinic_id = ? AND chat_id = ?', (clinic_id, chat_id))
+            if cursor.fetchone():
+                await update.message.reply_text("⚠️ Вы уже в этой клинике!")
+            else:
+                cursor.execute('''
+                    INSERT INTO clinic_users (clinic_id, chat_id, username, first_name, role)
+                    VALUES (?, ?, ?, ?, 'user')
+                ''', (clinic_id, chat_id, user.username, user.first_name))
+                
+                conn.commit()
+                
+                await update.message.reply_text(
+                    f"✅ *Вы присоединились!*\n\n"
+                    f"🏥 Клиника: {clinic_name}\n"
+                    f"👤 Ваша роль: Пользователь\n\n"
+                    f"Теперь вы можете просматривать общий склад.",
+                    reply_markup=get_main_keyboard(True, False),
+                    parse_mode='Markdown'
+                )
+        else:
+            await update.message.reply_text("❌ *Код не найден!*\nПроверьте код и попробуйте еще раз.", parse_mode='Markdown')
+        
+        conn.close()
+        context.user_data['joining_clinic'] = False
+    
+    else:
+        await update.message.reply_text(
+            "Используйте кнопки меню 📱",
+            reply_markup=get_main_keyboard(has_clinic, is_admin)
+        )
+
+# ========== ЗАПУСК ==========
+async def main():
+    app = Application.builder().token(TOKEN).build()
+    
+    # Команды
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("leave", leave_clinic))
+    app.add_handler(CommandHandler("exit", leave_clinic))
+    
+    # Callback обработчики
+    app.add_handler(CallbackQueryHandler(handle_category, pattern='^cat_'))
+    app.add_handler(CallbackQueryHandler(handle_remove_category, pattern='^remove_cat_'))
+    app.add_handler(CallbackQueryHandler(execute_remove, pattern='^do_remove_'))
+    
+    # 🔍 Обработчики для поиска
+    app.add_handler(CallbackQueryHandler(handle_search_results, pattern='^search_'))
+    app.add_handler(CallbackQueryHandler(remove_from_search, pattern='^remove_from_search_'))
+    app.add_handler(CallbackQueryHandler(handle_search_results, pattern='^new_search_'))
+    app.add_handler(CallbackQueryHandler(handle_search_results, pattern='^back_menu_'))
+    app.add_handler(CallbackQueryHandler(handle_search_results, pattern='^back_'))
+    
+    # Текстовые сообщения
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    print("=" * 60)
+    print("🤖 БОТ 'СКЛАДСТОМ' ПОЛНОСТЬЮ ЗАПУЩЕН!")
+    print("✅ БЕЗОПАСНОСТЬ: SQL-инъекции ЗАКРЫТЫ")
+    print("🔍 ПОИСК ТОВАРОВ: ДОБАВЛЕН!")
+    print("=" * 60)
+    print("📱 ВСЕ ФУНКЦИИ:")
+    print("1. 🏥 Создание клиник с кодами доступа")
+    print("2. 🔑 Присоединение сотрудников по коду")
+    print("3. 📦 Просмотр склада по категориям")
+    print("4. 🔍 Поиск товаров по названию")
+    print("5. ➖ Списание материалов (1 единица)")
+    print("6. 🛒 Автоматический список для заказа")
+    print("7. ➕ Добавление новых материалов")
+    print("8. 👥 Управление сотрудниками (админ)")
+    print("9. 🚪 Выход из клиники (/leave)")
+    print("=" * 60)
+    print("📋 КОМАНДЫ:")
+    print("/start - Начать работу")
+    print("/leave - Выйти из клиники")
+    print("/exit - Альтернатива /leave")
+    print("=" * 60)
+    print("🔍 КАК ИСКАТЬ ТОВАРЫ:")
+    print("1. Нажмите '🔍 Поиск товара'")
+    print("2. Введите часть названия")
+    print("3. Выберите товар из списка")
+    print("4. Можно сразу списать!")
+    print("=" * 60)
+    print("⚠️ ВАЖНО: Вставьте свой токен в строку TOKEN!")
+    print("=" * 60)
+    
+    await app.run_polling()
+
+# Запуск бота
+if __name__ == '__main__':
+    asyncio.run(main())
